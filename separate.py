@@ -65,6 +65,15 @@ def clear_gpu_cache():
 warnings.filterwarnings("ignore")
 cpu = torch.device('cpu')
 
+class PassthroughDataParallel(torch.nn.DataParallel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
 class SeperateAttributes:
     def __init__(self, model_data: ModelData, 
                  process_data: dict, 
@@ -468,6 +477,16 @@ class SeperateAttributes:
             source = self.pitch_fix(source, sr_pitched, mix)
 
         return source
+    
+    def make_dataparallel(self, model, manual_alloc=False):
+        num_gpus = 1
+        if (torch_device := torch.device(self.device)).type == "cuda":
+            primary_device = torch_device.index
+            other_devices = [i for i in range(torch.cuda.device_count()) if i != primary_device]
+            device_ids = [primary_device] + other_devices
+            model = PassthroughDataParallel(model, device_ids=device_ids, manual_alloc=manual_alloc)
+            num_gpus = len(device_ids)
+        return model, num_gpus
 
 class SeperateMDX(SeperateAttributes):        
 
@@ -740,6 +759,7 @@ class SeperateMDXC(SeperateAttributes):
         model = TFC_TDF_net(self.mdx_c_configs, device=self.device)
         model.load_state_dict(torch.load(self.model_path, map_location=cpu))
         model.to(self.device).eval()
+        model, num_gpus = self.make_dataparallel(model)
         mix = torch.tensor(mix, dtype=torch.float32)
 
         try:
@@ -749,7 +769,7 @@ class SeperateMDXC(SeperateAttributes):
 
         mdx_segment_size = self.mdx_c_configs.inference.dim_t if self.is_mdx_c_seg_def else self.mdx_segment_size
         
-        batch_size = self.mdx_batch_size
+        batch_size = max(self.mdx_batch_size // num_gpus, 1)
         chunk_size = self.mdx_c_configs.audio.hop_length * (mdx_segment_size - 1)
         overlap = self.overlap_mdx23
 
